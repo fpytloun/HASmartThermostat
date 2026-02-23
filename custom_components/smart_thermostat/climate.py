@@ -167,9 +167,14 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(const.CONF_KI, default=const.DEFAULT_KI): vol.Coerce(float),
         vol.Optional(const.CONF_KD, default=const.DEFAULT_KD): vol.Coerce(float),
         vol.Optional(const.CONF_KE, default=const.DEFAULT_KE): vol.Coerce(float),
+        vol.Optional(const.CONF_KP_COOL): vol.Coerce(float),
+        vol.Optional(const.CONF_KI_COOL): vol.Coerce(float),
+        vol.Optional(const.CONF_KD_COOL): vol.Coerce(float),
+        vol.Optional(const.CONF_KE_COOL): vol.Coerce(float),
         vol.Optional(const.CONF_PWM, default=const.DEFAULT_PWM): vol.All(
             cv.time_period, cv.positive_timedelta
         ),
+        vol.Optional(const.CONF_COOLER_PWM, default=True): cv.boolean,
         vol.Optional(const.CONF_BOOST_PID_OFF, default=False): cv.boolean,
         vol.Optional(const.CONF_AUTOTUNE, default=const.DEFAULT_AUTOTUNE): cv.string,
         vol.Optional(const.CONF_NOISEBAND, default=const.DEFAULT_NOISEBAND): vol.Coerce(
@@ -236,7 +241,12 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         "ki": config.get(const.CONF_KI),
         "kd": config.get(const.CONF_KD),
         "ke": config.get(const.CONF_KE),
+        "kp_cool": config.get(const.CONF_KP_COOL),
+        "ki_cool": config.get(const.CONF_KI_COOL),
+        "kd_cool": config.get(const.CONF_KD_COOL),
+        "ke_cool": config.get(const.CONF_KE_COOL),
         "pwm": config.get(const.CONF_PWM),
+        "cooler_pwm": config.get(const.CONF_COOLER_PWM),
         "boost_pid_off": config.get(const.CONF_BOOST_PID_OFF),
         "autotune": config.get(const.CONF_AUTOTUNE),
         "noiseband": config.get(const.CONF_NOISEBAND),
@@ -397,10 +407,17 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._heat_cool_last_sign = (
             0  # Track output sign for HEAT_COOL mode transitions
         )
+        self._is_cooling_active = False  # Track which gain set is loaded
         self._kp = kwargs.get("kp")
         self._ki = kwargs.get("ki")
         self._kd = kwargs.get("kd")
         self._ke = kwargs.get("ke")
+        # Cooling PID gains — fall back to heating gains if not provided
+        self._kp_cool = kwargs.get("kp_cool") or self._kp
+        self._ki_cool = kwargs.get("ki_cool") or self._ki
+        self._kd_cool = kwargs.get("kd_cool") or self._kd
+        self._ke_cool = kwargs.get("ke_cool") or self._ke
+        self._cooler_pwm = kwargs.get("cooler_pwm", True)
         self._pwm = kwargs.get("pwm").seconds
         self._p = self._i = self._d = self._e = self._dt = 0
         self._control_output = self._output_min
@@ -606,6 +623,16 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             ):
                 self._ke = float(old_state.attributes.get("Ke"))
                 self._pid_controller.set_pid_param(ke=self._ke)
+            # Restore cooling gains (no need to apply to PID controller —
+            # they are loaded on demand when output sign changes to cooling)
+            if old_state.attributes.get("kp_cool") is not None:
+                self._kp_cool = float(old_state.attributes.get("kp_cool"))
+            if old_state.attributes.get("ki_cool") is not None:
+                self._ki_cool = float(old_state.attributes.get("ki_cool"))
+            if old_state.attributes.get("kd_cool") is not None:
+                self._kd_cool = float(old_state.attributes.get("kd_cool"))
+            if old_state.attributes.get("ke_cool") is not None:
+                self._ke_cool = float(old_state.attributes.get("ke_cool"))
             if (
                 old_state.attributes.get("pid_mode") is not None
                 and self._pid_controller is not None
@@ -812,6 +839,10 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             "ki": self._ki,
             "kd": self._kd,
             "ke": self._ke,
+            "kp_cool": self._kp_cool,
+            "ki_cool": self._ki_cool,
+            "kd_cool": self._kd_cool,
+            "ke_cool": self._ke_cool,
             "pid_mode": self.pid_mode,
             "pid_i": 0 if self._autotune != "none" else self.pid_control_i,
         }
@@ -931,11 +962,17 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self.async_write_ha_state()
 
     async def async_set_pid(self, **kwargs):
-        """Set PID parameters."""
+        """Set PID parameters (heating and/or cooling gains)."""
         for pid_kx, gain in kwargs.items():
             if gain is not None:
                 setattr(self, f"_{pid_kx}", float(gain))
-        self._pid_controller.set_pid_param(self._kp, self._ki, self._kd, self._ke)
+        # Apply the currently active gain set to the PID controller
+        if self._is_cooling_active:
+            self._pid_controller.set_pid_param(
+                self._kp_cool, self._ki_cool, self._kd_cool, self._ke_cool
+            )
+        else:
+            self._pid_controller.set_pid_param(self._kp, self._ki, self._kd, self._ke)
         await self._async_control_heating(calc_pid=True)
 
     async def async_set_pid_mode(self, **kwargs):
@@ -1358,7 +1395,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     async def set_control_value(self):
         """Set Output value for heater"""
         # In HEAT_COOL mode, detect when PID output sign flips (heating <-> cooling)
-        # and turn off the previous entity before starting the new one
+        # and turn off the previous entity before starting the new one.
+        # Also swap PID gains between heating and cooling sets.
         if self._hvac_mode == HVACMode.HEAT_COOL and self._cooler_entity_id is not None:
             if self._control_output > 0:
                 current_sign = 1
@@ -1377,7 +1415,71 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 await self._async_heater_turn_off(force=True)
                 self._time_changed = time.time()
                 self._force_on = True
+                # Swap PID gains and clear integral for the new mode
+                if current_sign > 0:
+                    # Switching to heating gains
+                    self._is_cooling_active = False
+                    if self._pid_controller is not None:
+                        self._pid_controller.set_pid_param(
+                            self._kp, self._ki, self._kd, self._ke
+                        )
+                        self._pid_controller.integral = 0
+                        self._i = 0
+                    _LOGGER.info(
+                        "%s: Loaded heating gains Kp=%s Ki=%s Kd=%s Ke=%s",
+                        self.entity_id,
+                        self._kp,
+                        self._ki,
+                        self._kd,
+                        self._ke,
+                    )
+                else:
+                    # Switching to cooling gains
+                    self._is_cooling_active = True
+                    if self._pid_controller is not None:
+                        self._pid_controller.set_pid_param(
+                            self._kp_cool,
+                            self._ki_cool,
+                            self._kd_cool,
+                            self._ke_cool,
+                        )
+                        self._pid_controller.integral = 0
+                        self._i = 0
+                    _LOGGER.info(
+                        "%s: Loaded cooling gains Kp=%s Ki=%s Kd=%s Ke=%s",
+                        self.entity_id,
+                        self._kp_cool,
+                        self._ki_cool,
+                        self._kd_cool,
+                        self._ke_cool,
+                    )
             self._heat_cool_last_sign = current_sign
+            # Non-PWM cooler path: when cooler_pwm is disabled, just turn
+            # the cooler on/off based on output sign (no duty cycling).
+            # The PID output magnitude is still available as control_output
+            # attribute for automations to use (e.g., to set AC target temp).
+            if not self._cooler_pwm and self._control_output < 0:
+                if not self._is_device_active:
+                    _LOGGER.info(
+                        "%s: Cooler ON (no PWM), output=%s, turning ON %s",
+                        self.entity_id,
+                        round(self._control_output, 1),
+                        ", ".join([entity for entity in self.heater_or_cooler_entity]),
+                    )
+                    self._time_changed = time.time()
+                await self._async_heater_turn_on()
+                return
+            if not self._cooler_pwm and self._control_output >= 0:
+                if self._is_device_active:
+                    _LOGGER.info(
+                        "%s: Cooler OFF (no PWM), output=%s, turning OFF %s",
+                        self.entity_id,
+                        round(self._control_output, 1),
+                        ", ".join([entity for entity in self.heater_or_cooler_entity]),
+                    )
+                    self._time_changed = time.time()
+                await self._async_heater_turn_off()
+                return
         if self._pwm:
             if abs(self._control_output) == self._difference:
                 if not self._is_device_active:
