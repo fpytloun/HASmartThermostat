@@ -264,6 +264,10 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
             vol.Optional("ki"): vol.Coerce(float),
             vol.Optional("kd"): vol.Coerce(float),
             vol.Optional("ke"): vol.Coerce(float),
+            vol.Optional("kp_cool"): vol.Coerce(float),
+            vol.Optional("ki_cool"): vol.Coerce(float),
+            vol.Optional("kd_cool"): vol.Coerce(float),
+            vol.Optional("ke_cool"): vol.Coerce(float),
         },
         "async_set_pid",
     )
@@ -972,6 +976,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             self._pid_controller.out_max = self._max_out
             self._pid_controller.out_min = self._min_out
         if self._hvac_mode != HVACMode.OFF:
+            # Reset cycle timer so the forced turn_off above doesn't block
+            # the first turn_on via min_off_cycle_duration check.  Also
+            # force the PWM to start with the ON phase immediately.
+            self._last_heat_cycle_time = 0
+            self._force_on = True
+            self._time_changed = time.time()
             await self._async_control_heating(calc_pid=True)
         # Ensure we update the current operation after changing the mode
         self.async_write_ha_state()
