@@ -1405,6 +1405,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             else:
                 current_sign = 0
             last_sign = self._heat_cool_last_sign
+            # On actual sign change (not first run), turn off the previous
+            # entity before starting the new one and force immediate switch.
             if last_sign != 0 and current_sign != 0 and current_sign != last_sign:
                 _LOGGER.info(
                     "%s: HEAT_COOL sign change (%s -> %s), turning off all entities",
@@ -1415,44 +1417,47 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 await self._async_heater_turn_off(force=True)
                 self._time_changed = time.time()
                 self._force_on = True
-                # Swap PID gains and clear integral for the new mode
-                if current_sign > 0:
-                    # Switching to heating gains
-                    self._is_cooling_active = False
-                    if self._pid_controller is not None:
-                        self._pid_controller.set_pid_param(
-                            self._kp, self._ki, self._kd, self._ke
-                        )
-                        self._pid_controller.integral = 0
-                        self._i = 0
-                    _LOGGER.info(
-                        "%s: Loaded heating gains Kp=%s Ki=%s Kd=%s Ke=%s",
-                        self.entity_id,
-                        self._kp,
-                        self._ki,
-                        self._kd,
-                        self._ke,
+            # Ensure the correct PID gain set is loaded whenever the output
+            # direction is known.  This handles both sign changes AND the
+            # first PID computation after startup (when last_sign is still 0
+            # and the gain-loading would otherwise be skipped).
+            if current_sign > 0 and self._is_cooling_active:
+                # Need heating gains but cooling gains are active
+                self._is_cooling_active = False
+                if self._pid_controller is not None:
+                    self._pid_controller.set_pid_param(
+                        self._kp, self._ki, self._kd, self._ke
                     )
-                else:
-                    # Switching to cooling gains
-                    self._is_cooling_active = True
-                    if self._pid_controller is not None:
-                        self._pid_controller.set_pid_param(
-                            self._kp_cool,
-                            self._ki_cool,
-                            self._kd_cool,
-                            self._ke_cool,
-                        )
-                        self._pid_controller.integral = 0
-                        self._i = 0
-                    _LOGGER.info(
-                        "%s: Loaded cooling gains Kp=%s Ki=%s Kd=%s Ke=%s",
-                        self.entity_id,
+                    self._pid_controller.integral = 0
+                    self._i = 0
+                _LOGGER.info(
+                    "%s: Loaded heating gains Kp=%s Ki=%s Kd=%s Ke=%s",
+                    self.entity_id,
+                    self._kp,
+                    self._ki,
+                    self._kd,
+                    self._ke,
+                )
+            elif current_sign < 0 and not self._is_cooling_active:
+                # Need cooling gains but heating gains are active
+                self._is_cooling_active = True
+                if self._pid_controller is not None:
+                    self._pid_controller.set_pid_param(
                         self._kp_cool,
                         self._ki_cool,
                         self._kd_cool,
                         self._ke_cool,
                     )
+                    self._pid_controller.integral = 0
+                    self._i = 0
+                _LOGGER.info(
+                    "%s: Loaded cooling gains Kp=%s Ki=%s Kd=%s Ke=%s",
+                    self.entity_id,
+                    self._kp_cool,
+                    self._ki_cool,
+                    self._kd_cool,
+                    self._ke_cool,
+                )
             self._heat_cool_last_sign = current_sign
             # Non-PWM cooler path: when cooler_pwm is disabled, just turn
             # the cooler on/off based on output sign (no duty cycling).
