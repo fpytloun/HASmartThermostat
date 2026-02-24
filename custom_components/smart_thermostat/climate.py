@@ -902,10 +902,42 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             self._min_out = self._output_clamp_low
             self._max_out = self._output_clamp_high
             self._hvac_mode = HVACMode.HEAT
+            # Load heating gains when switching to HEAT mode
+            if self._is_cooling_active and self._pid_controller is not None:
+                self._is_cooling_active = False
+                self._pid_controller.set_pid_param(
+                    self._kp, self._ki, self._kd, self._ke
+                )
+                self._pid_controller.integral = 0
+                self._i = 0
+                _LOGGER.info(
+                    "%s: Loaded heating gains Kp=%s Ki=%s Kd=%s Ke=%s",
+                    self.entity_id,
+                    self._kp,
+                    self._ki,
+                    self._kd,
+                    self._ke,
+                )
         elif hvac_mode == HVACMode.COOL:
             self._min_out = -self._output_clamp_high
             self._max_out = -self._output_clamp_low
             self._hvac_mode = HVACMode.COOL
+            # Load cooling gains when switching to COOL mode
+            if not self._is_cooling_active and self._pid_controller is not None:
+                self._is_cooling_active = True
+                self._pid_controller.set_pid_param(
+                    self._kp_cool, self._ki_cool, self._kd_cool, self._ke_cool
+                )
+                self._pid_controller.integral = 0
+                self._i = 0
+                _LOGGER.info(
+                    "%s: Loaded cooling gains Kp=%s Ki=%s Kd=%s Ke=%s",
+                    self.entity_id,
+                    self._kp_cool,
+                    self._ki_cool,
+                    self._kd_cool,
+                    self._ke_cool,
+                )
         elif hvac_mode == HVACMode.HEAT_COOL:
             self._min_out = -self._output_clamp_high
             self._max_out = self._output_clamp_high
@@ -1459,11 +1491,17 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     self._ke_cool,
                 )
             self._heat_cool_last_sign = current_sign
-            # Non-PWM cooler path: when cooler_pwm is disabled, just turn
-            # the cooler on/off based on output sign (no duty cycling).
-            # The PID output magnitude is still available as control_output
-            # attribute for automations to use (e.g., to set AC target temp).
-            if not self._cooler_pwm and self._control_output < 0:
+        # Non-PWM cooler path: when cooler_pwm is disabled, just turn
+        # the cooler on/off based on output sign (no duty cycling).
+        # Works in both COOL and HEAT_COOL modes.
+        # The PID output magnitude is still available as control_output
+        # attribute for automations to use (e.g., to set AC target temp).
+        if (
+            not self._cooler_pwm
+            and self._cooler_entity_id is not None
+            and self._hvac_mode in (HVACMode.COOL, HVACMode.HEAT_COOL)
+        ):
+            if self._control_output < 0:
                 if not self._is_device_active:
                     _LOGGER.info(
                         "%s: Cooler ON (no PWM), output=%s, turning ON %s",
@@ -1474,16 +1512,25 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     self._time_changed = time.time()
                 await self._async_heater_turn_on()
                 return
-            if not self._cooler_pwm and self._control_output >= 0:
-                if self._is_device_active:
+            # Output is non-negative: ensure cooler is off.
+            # In COOL mode, return after turning off (nothing else to do).
+            # In HEAT_COOL mode, fall through to the PWM heating path.
+            # Always send turn_off to cooler entities (idempotent) to
+            # guarantee the cooler is off regardless of _is_device_active
+            # which may be checking the heater entity in HEAT_COOL mode.
+            for cooler_entity in self._cooler_entity_id:
+                if self.hass.states.is_state(cooler_entity, STATE_ON):
                     _LOGGER.info(
                         "%s: Cooler OFF (no PWM), output=%s, turning OFF %s",
                         self.entity_id,
                         round(self._control_output, 1),
-                        ", ".join([entity for entity in self.heater_or_cooler_entity]),
+                        cooler_entity,
                     )
-                    self._time_changed = time.time()
-                await self._async_heater_turn_off()
+                    data = {ATTR_ENTITY_ID: cooler_entity}
+                    await self.hass.services.async_call(
+                        HA_DOMAIN, SERVICE_TURN_OFF, data
+                    )
+            if self._hvac_mode == HVACMode.COOL:
                 return
         if self._pwm:
             if abs(self._control_output) == self._difference:
